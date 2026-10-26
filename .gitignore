@@ -1,0 +1,34 @@
+
+# .NET build output
+bin
+obj
+.vs
+
+# Published applications and generated release packages
+publish
+publish-
+artifacts
+release-assets
+
+# IDE settings
+.vscode
+.idea
+.user
+.suo
+
+# ZArchive and game packages
+.zar
+.wua
+.pkg
+eboot.bin
+
+# Extracted game directories
+app0
+sce_sys
+sce_module
+data
+download0
+PPSA
+
+# Temporary extraction files
+.zartmp-
