@@ -9,6 +9,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ZArchiveSharp;
+using ZArchiveSharp.Zstd;
+using System.IO.Enumeration;
 
 namespace ZarExplorer;
 
@@ -47,8 +49,42 @@ internal sealed record SearchOutcome(
 internal sealed record ExtractSummary(
     int Extracted, int Skipped, int Failed, List<string> Errors);
 
+internal sealed record PackSourceFile(
+    string SourcePath, string ArchivePath, ulong Size);
+
+internal sealed record PackSummary(
+    int FilesWritten, ulong InputBytes, ulong ArchiveBytes);
+
 internal sealed class MainForm : Form
 {
+
+private static bool MatchesSearchTerm(
+    string candidate,
+    string query)
+{
+    if (query.Contains('*') || query.Contains('?'))
+    {
+        // Normalize Windows separators for path-pattern searches.
+        string expression = query.Replace('\\', '/');
+        string value = candidate.Replace('\\', '/');
+
+        return FileSystemName.MatchesSimpleExpression(
+            expression.AsSpan(),
+            value.AsSpan(),
+            ignoreCase: true);
+    }
+
+    // Preserve existing substring-search behavior.
+    return candidate.Contains(
+        query,
+        StringComparison.OrdinalIgnoreCase);
+}
+
+
+
+
+
+
     private const int SearchResultLimit = 100_000;
     private const int PreviewLimit = 64 * 1024;
 
@@ -84,20 +120,31 @@ internal sealed class MainForm : Form
     private readonly ToolStrip _toolbar = new();
     private readonly ToolStripButton _openButton =
         new("Open");
+
+    private readonly ToolStripButton _createArchiveButton =
+        new("Create archive");
+
     private readonly ToolStripButton _upButton =
         new("Up");
+
     private readonly ToolStripButton _extractButton =
         new("Extract selected");
+
     private readonly ToolStripButton _folderButton =
         new("Extract folder");
+
     private readonly ToolStripButton _allButton =
         new("Extract all");
+
     private readonly ToolStripButton _exportButton =
         new("Export CSV");
+
     private readonly ToolStripButton _previewButton =
         new("Preview");
+
     private readonly ToolStripButton _infoButton =
         new("Archive info");
+
     private readonly ToolStripButton _cancelButton =
         new("Cancel");
 
@@ -199,6 +246,18 @@ internal sealed class MainForm : Form
 
         _fileMenu.DropDownItems.Add(
             new ToolStripMenuItem(
+                "Create archive...",
+                null,
+                async (_, _) => await CreateArchiveAsync())
+            {
+                ShortcutKeys = Keys.Control | Keys.Shift | Keys.N
+            });
+
+        _fileMenu.DropDownItems.Add(
+            new ToolStripSeparator());
+
+        _fileMenu.DropDownItems.Add(
+            new ToolStripMenuItem(
                 "Close archive",
                 null,
                 (_, _) => CloseArchive()));
@@ -255,8 +314,8 @@ internal sealed class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        "ZAR Explorer\n\n" +
-                        "Read-only ZArchive browser and selective extractor.\n" +
+                        "ZAR Explorer v0.2.0\n\n" +
+                        "ZArchive browser, selective extractor, and archive creator.\n" +
                         "Powered by ZArchiveSharp.",
                         "About",
                         MessageBoxButtons.OK,
@@ -270,6 +329,9 @@ internal sealed class MainForm : Form
         // Toolbar actions
         _openButton.Click +=
             async (_, _) => await OpenDialogAsync();
+
+        _createArchiveButton.Click +=
+            async (_, _) => await CreateArchiveAsync();
 
         _upButton.Click +=
             (_, _) => GoUp();
@@ -298,6 +360,7 @@ internal sealed class MainForm : Form
         _toolbar.Items.AddRange(new ToolStripItem[]
         {
             _openButton,
+            _createArchiveButton,
             new ToolStripSeparator(),
             _upButton,
             new ToolStripSeparator(),
@@ -533,10 +596,6 @@ internal sealed class MainForm : Form
         previewPanel.Controls.Add(_preview);
         previewPanel.Controls.Add(_previewHeader);
 
-        // IMPORTANT:
-        // Do not manually set SplitterDistance here or from a Shown
-        // event. Windows Forms will initialize the splitter positions
-        // using its defaults as the parent controls are laid out.
         var rightSplit = new SplitContainer
         {
             Dock = DockStyle.Fill,
@@ -607,6 +666,7 @@ internal sealed class MainForm : Form
         _fileMenu.Enabled = !_busy;
 
         _openButton.Enabled = !_busy;
+        _createArchiveButton.Enabled = !_busy;
         _upButton.Enabled = !_busy;
         _extractButton.Enabled = !_busy;
         _folderButton.Enabled = !_busy;
@@ -764,6 +824,387 @@ internal sealed class MainForm : Form
                     $"{_reader.EntryCount:N0} entries, " +
                     $"{FormatSize(_reader.TotalUncompressedSize)} uncompressed"));
             });
+    }
+
+    // ------------------------------------------------------------
+    // Create archive
+    // ------------------------------------------------------------
+
+    private async Task CreateArchiveAsync()
+    {
+        if (_busy)
+            return;
+
+        using var dialog = new CreateArchiveDialog();
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        List<PackSourceFile> files = dialog.Files.ToList();
+        string outputPath = dialog.OutputPath;
+
+        if (files.Count == 0)
+        {
+            MessageBox.Show(
+                this,
+                "Add at least one file or folder before creating the archive.",
+                "Create archive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+
+            return;
+        }
+
+        if (_archivePath != null &&
+            string.Equals(
+                Path.GetFullPath(outputPath),
+                Path.GetFullPath(_archivePath),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(
+                this,
+                "The destination is the archive currently open in ZAR Explorer.\n\n" +
+                "Choose a different output path.",
+                "Create archive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            return;
+        }
+
+        string normalizedOutput = Path.GetFullPath(outputPath);
+
+        if (files.Any(f =>
+            string.Equals(
+                Path.GetFullPath(f.SourcePath),
+                normalizedOutput,
+                StringComparison.OrdinalIgnoreCase)))
+        {
+            MessageBox.Show(
+                this,
+                "The output archive cannot overwrite one of its own source files.",
+                "Create archive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            return;
+        }
+
+        var duplicatePaths = files
+            .GroupBy(
+                f => NormalizeArchiveEntryPath(f.ArchivePath),
+                StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)
+            .Take(10)
+            .ToList();
+
+        if (duplicatePaths.Count > 0)
+        {
+            MessageBox.Show(
+                this,
+                "Two or more source files use the same archive path.\n\n" +
+                string.Join("\n", duplicatePaths) +
+                "\n\nRemove or rename the conflicting entries before continuing.",
+                "Create archive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            return;
+        }
+
+        if (File.Exists(normalizedOutput))
+        {
+            var answer = MessageBox.Show(
+                this,
+                $"The destination file already exists:\n\n{normalizedOutput}\n\n" +
+                "Replace it after the new archive has been created successfully?",
+                "Confirm overwrite",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            if (answer != DialogResult.Yes)
+                return;
+        }
+
+        await RunOperationAsync(
+            "Creating archive...",
+            async (ct, progress) =>
+            {
+                var summary = await Task.Run(
+                    () => PackArchive(
+                        files,
+                        normalizedOutput,
+                        ct,
+                        progress),
+                    ct);
+
+                progress.Report(new OpStatus(
+                    $"Archive created: {summary.FilesWritten:N0} files, " +
+                    $"{FormatSize(summary.ArchiveBytes)}",
+                    100));
+
+                MessageBox.Show(
+                    this,
+                    "Archive creation completed.\n\n" +
+                    $"Files written: {summary.FilesWritten:N0}\n" +
+                    $"Uncompressed input size: {FormatSize(summary.InputBytes)}\n" +
+                    $"Archive size: {FormatSize(summary.ArchiveBytes)}\n\n" +
+                    $"Output:\n{normalizedOutput}\n\n" +
+                    "The archive uses the default ZArchiveSharp compression settings.",
+                    "Create archive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            });
+    }
+
+    private static PackSummary PackArchive(
+        IReadOnlyList<PackSourceFile> files,
+        string outputPath,
+        CancellationToken token,
+        IProgress<OpStatus> progress)
+    {
+        if (files.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "There are no files to add to the archive.");
+        }
+
+        string fullOutput = Path.GetFullPath(outputPath);
+        string? outputDirectory = Path.GetDirectoryName(fullOutput);
+
+        if (string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            throw new IOException(
+                "Could not determine the output directory.");
+        }
+
+        Directory.CreateDirectory(outputDirectory);
+
+        ulong totalBytes = 0;
+
+        foreach (var file in files)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (!File.Exists(file.SourcePath))
+            {
+                throw new FileNotFoundException(
+                    "A source file no longer exists.",
+                    file.SourcePath);
+            }
+
+            ValidateArchiveEntryPath(file.ArchivePath);
+
+            totalBytes = SaturatingAdd(totalBytes, file.Size);
+        }
+
+        string tempPath = fullOutput + ".zartmp-" +
+            Guid.NewGuid().ToString("N");
+
+        ulong completedBytes = 0;
+        int writtenFiles = 0;
+        byte[] buffer = new byte[1024 * 1024];
+
+        try
+        {
+            using (var output = new FileStream(
+                tempPath,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1024 * 1024,
+                FileOptions.SequentialScan))
+            {
+                using (var writer = new ZArchiveWriter(
+                    output,
+                    maxDegreeOfParallelism: Math.Max(2, Environment.ProcessorCount),
+                    compressorFactory: () => new ZstdCompressor()))
+                {
+                    for (int index = 0; index < files.Count; index++)
+                    {
+                        token.ThrowIfCancellationRequested();
+
+                        var file = files[index];
+                        string archiveEntryPath =
+                            NormalizeArchiveEntryPath(file.ArchivePath);
+
+                        ulong copied = 0;
+
+                        progress.Report(new OpStatus(
+                            $"Adding {archiveEntryPath}",
+                            GetPercent(
+                                completedBytes,
+                                totalBytes,
+                                index,
+                                files.Count)));
+
+                        using (var input = new FileStream(
+                            file.SourcePath,
+                            FileMode.Open,
+                            FileAccess.Read,
+                            FileShare.Read,
+                            bufferSize: 1024 * 1024,
+                            FileOptions.SequentialScan))
+                        {
+                            if ((ulong)input.Length != file.Size)
+                            {
+                                throw new IOException(
+                                    $"The source file changed after it was queued:\n" +
+                                    $"{file.SourcePath}");
+                            }
+
+                            // Create the complete parent directory tree before adding the file.
+int lastSlash = archiveEntryPath.LastIndexOf('/');
+
+if (lastSlash > 0)
+{
+    string parentDirectory = archiveEntryPath[..lastSlash];
+
+    if (!writer.MakeDir(parentDirectory, recursive: true))
+    {
+        throw new IOException(
+            $"Could not create archive directory: {parentDirectory}");
+    }
+}
+
+// Never continue writing if the file entry could not be created.
+if (!writer.StartNewFile(archiveEntryPath))
+{
+    throw new IOException(
+        $"Could not create archive file entry: {archiveEntryPath}");
+}
+
+                            int read;
+
+                            while ((read = input.Read(
+                                buffer, 0, buffer.Length)) > 0)
+                            {
+                                token.ThrowIfCancellationRequested();
+
+                                writer.AppendData(
+                                    buffer.AsSpan(0, read));
+
+                                copied = SaturatingAdd(
+                                    copied, (ulong)read);
+
+                                if (copied % (16UL * 1024 * 1024) <
+                                    (ulong)read)
+                                {
+                                    progress.Report(new OpStatus(
+                                        $"Writing {archiveEntryPath}",
+                                        GetPercent(
+                                            SaturatingAdd(
+                                                completedBytes, copied),
+                                            totalBytes,
+                                            index,
+                                            files.Count)));
+                                }
+                            }
+                        }
+
+                        if (copied != file.Size)
+                        {
+                            throw new IOException(
+                                $"The source file size changed while reading:\n" +
+                                $"{file.SourcePath}\n\n" +
+                                $"Expected {file.Size:N0} bytes; read {copied:N0} bytes.");
+                        }
+
+                        completedBytes = SaturatingAdd(
+                            completedBytes, copied);
+
+                        writtenFiles++;
+
+                        progress.Report(new OpStatus(
+                            $"Added {writtenFiles:N0}/{files.Count:N0}: " +
+                            archiveEntryPath,
+                            GetPercent(
+                                completedBytes,
+                                totalBytes,
+                                writtenFiles,
+                                files.Count)));
+                    }
+
+                    token.ThrowIfCancellationRequested();
+
+                    writer.Finalize();
+
+                    // Persist the finished archive before moving it to
+                    // the destination path.
+                    output.Flush(true);
+                }
+            }
+
+            token.ThrowIfCancellationRequested();
+
+            // Same-directory temporary output keeps final replacement
+            // separate from archive construction. A failed or cancelled
+            // pack will not replace an existing destination.
+            File.Move(tempPath, fullOutput, overwrite: true);
+            tempPath = "";
+
+            ulong archiveBytes = (ulong)new FileInfo(fullOutput).Length;
+
+            progress.Report(new OpStatus(
+                $"Archive complete: {fullOutput}",
+                100));
+
+            return new PackSummary(
+                writtenFiles,
+                totalBytes,
+                archiveBytes);
+        }
+        catch
+        {
+            TryDelete(tempPath);
+            throw;
+        }
+        finally
+        {
+            TryDelete(tempPath);
+        }
+    }
+
+    private static ulong SaturatingAdd(ulong left, ulong right)
+    {
+        return left > ulong.MaxValue - right
+            ? ulong.MaxValue
+            : left + right;
+    }
+
+    private static string NormalizeArchiveEntryPath(string path)
+    {
+        return path.Replace('\\', '/');
+    }
+
+    internal static void ValidateArchiveEntryPath(string archivePath)
+    {
+        string normalized = NormalizeArchiveEntryPath(archivePath);
+
+        if (string.IsNullOrWhiteSpace(normalized) ||
+            normalized.StartsWith('/') ||
+            Path.IsPathRooted(normalized))
+        {
+            throw new IOException(
+                $"Unsafe or empty archive path: {archivePath}");
+        }
+
+        string[] parts = normalized.Split('/');
+
+        if (parts.Length == 0 ||
+            parts.Any(part =>
+                string.IsNullOrEmpty(part) ||
+                part == "." ||
+                part == ".." ||
+                part.Contains(':') ||
+                part.Any(char.IsControl) ||
+                part.IndexOfAny(
+                    Path.GetInvalidFileNameChars()) >= 0))
+        {
+            throw new IOException(
+                $"Archive path contains unsafe components: {archivePath}");
+        }
     }
 
     private void CloseArchive()
@@ -1130,12 +1571,8 @@ internal sealed class MainForm : Form
 
             scanned++;
 
-            if (entry.Name.Contains(
-                    query,
-                    StringComparison.OrdinalIgnoreCase) ||
-                path.Contains(
-                    query,
-                    StringComparison.OrdinalIgnoreCase))
+            if (MatchesSearchTerm(entry.Name, query) ||
+                MatchesSearchTerm(path, query))
             {
                 matches.Add(new ArchiveItem(
                     child,
@@ -1147,6 +1584,7 @@ internal sealed class MainForm : Form
                 if (matches.Count >= SearchResultLimit)
                     return true;
             }
+
 
             if (scanned % 5000 == 0)
             {
@@ -2052,6 +2490,690 @@ internal sealed class MainForm : Form
             "Archive information",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
+    }
+
+    private static string FormatSize(ulong bytes)
+    {
+        string[] units =
+        {
+            "B", "KB", "MB", "GB", "TB", "PB"
+        };
+
+        double value = bytes;
+        int unit = 0;
+
+        while (value >= 1024 &&
+               unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return unit == 0
+            ? $"{bytes:N0} B"
+            : $"{value:0.##} {units[unit]}";
+    }
+}
+
+// =====================================================================
+// Create Archive dialog
+// =====================================================================
+
+internal sealed class CreateArchiveDialog : Form
+{
+    private readonly List<PackSourceFile> _files = new();
+
+    private readonly ListView _list = new();
+    private readonly TextBox _outputBox = new();
+
+    private readonly Label _summaryLabel = new();
+
+    public IReadOnlyList<PackSourceFile> Files => _files;
+
+    public string OutputPath { get; private set; } = "";
+
+    public CreateArchiveDialog()
+    {
+        Text = "Create ZArchive";
+        Width = 1000;
+        Height = 650;
+        MinimumSize = new Size(760, 450);
+        StartPosition = FormStartPosition.CenterParent;
+        ShowInTaskbar = false;
+
+        BuildUi();
+        UpdateSummary();
+    }
+
+    private void BuildUi()
+    {
+        var addFilesButton = new Button
+        {
+            Text = "Add files...",
+            AutoSize = true
+        };
+
+        var addFolderContentsButton = new Button
+        {
+            Text = "Add folder contents...",
+            AutoSize = true
+        };
+
+        var addFolderRootButton = new Button
+        {
+            Text = "Add folder with root name...",
+            AutoSize = true
+        };
+
+        var removeButton = new Button
+        {
+            Text = "Remove selected",
+            AutoSize = true
+        };
+
+        var clearButton = new Button
+        {
+            Text = "Clear list",
+            AutoSize = true
+        };
+
+        addFilesButton.Click += (_, _) => AddFiles();
+        addFolderContentsButton.Click +=
+            (_, _) => AddFolder(includeFolderName: false);
+        addFolderRootButton.Click +=
+            (_, _) => AddFolder(includeFolderName: true);
+        removeButton.Click += (_, _) => RemoveSelected();
+        clearButton.Click += (_, _) => ClearList();
+
+        var actions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            AutoScroll = true,
+            Padding = new Padding(5)
+        };
+
+        actions.Controls.Add(addFilesButton);
+        actions.Controls.Add(addFolderContentsButton);
+        actions.Controls.Add(addFolderRootButton);
+        actions.Controls.Add(removeButton);
+        actions.Controls.Add(clearButton);
+
+        _list.Dock = DockStyle.Fill;
+        _list.View = View.Details;
+        _list.FullRowSelect = true;
+        _list.GridLines = true;
+        _list.MultiSelect = true;
+        _list.HideSelection = false;
+
+        _list.Columns.Add("Archive path", 260);
+        _list.Columns.Add("Source file", 500);
+        _list.Columns.Add("Size", 100);
+
+        _list.ShowItemToolTips = true;
+
+        var outputLabel = new Label
+        {
+            Text = "Output archive:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(5, 8, 5, 5)
+        };
+
+        _outputBox.Dock = DockStyle.Fill;
+        _outputBox.Text = Path.Combine(
+            Environment.GetFolderPath(
+                Environment.SpecialFolder.DesktopDirectory),
+            "newarchive.zar");
+
+        var browseOutputButton = new Button
+        {
+            Text = "Browse...",
+            AutoSize = true
+        };
+
+        browseOutputButton.Click += (_, _) => BrowseOutput();
+
+        var outputPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            Padding = new Padding(5),
+            Margin = Padding.Empty
+        };
+
+        outputPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.AutoSize));
+
+        outputPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.Percent, 100));
+
+        outputPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.AutoSize));
+
+        outputPanel.Controls.Add(outputLabel, 0, 0);
+        outputPanel.Controls.Add(_outputBox, 1, 0);
+        outputPanel.Controls.Add(browseOutputButton, 2, 0);
+
+        _summaryLabel.Dock = DockStyle.Fill;
+        _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _summaryLabel.Padding = new Padding(8, 0, 0, 0);
+
+        var createButton = new Button
+        {
+            Text = "Create archive",
+            AutoSize = true
+        };
+
+        var cancelButton = new Button
+        {
+            Text = "Cancel",
+            AutoSize = true,
+            DialogResult = DialogResult.Cancel
+        };
+
+        createButton.Click += (_, _) => ConfirmCreate();
+
+        var footer = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(5),
+            Margin = Padding.Empty
+        };
+
+        footer.Controls.Add(cancelButton);
+        footer.Controls.Add(createButton);
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = Padding.Empty,
+            Margin = Padding.Empty
+        };
+
+        layout.ColumnStyles.Add(
+            new ColumnStyle(SizeType.Percent, 100));
+
+        layout.RowStyles.Add(
+            new RowStyle(SizeType.AutoSize));
+
+        layout.RowStyles.Add(
+            new RowStyle(SizeType.Percent, 100));
+
+        layout.RowStyles.Add(
+            new RowStyle(SizeType.Absolute, 42));
+
+        layout.RowStyles.Add(
+            new RowStyle(SizeType.Absolute, 42));
+
+        layout.Controls.Add(actions, 0, 0);
+        layout.Controls.Add(_list, 0, 1);
+        layout.Controls.Add(outputPanel, 0, 2);
+
+        var bottomPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+
+        bottomPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.Percent, 100));
+
+        bottomPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.AutoSize));
+
+        bottomPanel.Controls.Add(_summaryLabel, 0, 0);
+        bottomPanel.Controls.Add(footer, 1, 0);
+
+        layout.Controls.Add(bottomPanel, 0, 3);
+
+        Controls.Add(layout);
+
+        AcceptButton = createButton;
+        CancelButton = cancelButton;
+    }
+
+    private void AddFiles()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Select files to add",
+            Filter = "All files (*.*)|*.*",
+            Multiselect = true,
+            CheckFileExists = true
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        var additions = new List<PackSourceFile>();
+
+        try
+        {
+            foreach (string filePath in dialog.FileNames)
+            {
+                var info = new FileInfo(filePath);
+
+                if (!info.Exists)
+                    continue;
+
+                if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                    continue;
+
+                additions.Add(new PackSourceFile(
+                    Path.GetFullPath(info.FullName),
+                    info.Name,
+                    (ulong)info.Length));
+            }
+
+            AddEntries(additions);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "Could not add files",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    private void AddFolder(bool includeFolderName)
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = includeFolderName
+                ? "Select a folder to add under its own root folder name"
+                : "Select a folder whose contents should become the archive root",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        try
+        {
+            string root = Path.GetFullPath(dialog.SelectedPath);
+
+            if (!Directory.Exists(root))
+            {
+                MessageBox.Show(
+                    this,
+                    "The selected directory no longer exists.",
+                    "Create archive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            if ((File.GetAttributes(root) &
+                 FileAttributes.ReparsePoint) != 0)
+            {
+                MessageBox.Show(
+                    this,
+                    "The selected folder is a junction or symbolic link.\n\n" +
+                    "Select its real target directory instead.",
+                    "Create archive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            List<PackSourceFile> additions =
+                ScanFolder(root, includeFolderName);
+
+            if (additions.Count == 0)
+            {
+                MessageBox.Show(
+                    this,
+                    "No regular files were found in the selected folder.",
+                    "Create archive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
+                return;
+            }
+
+            AddEntries(additions);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                ex.ToString(),
+                "Could not scan folder",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    private static List<PackSourceFile> ScanFolder(
+        string root,
+        bool includeFolderName)
+    {
+        var result = new List<PackSourceFile>();
+        var pending = new Stack<string>();
+
+        pending.Push(root);
+
+        string rootName = Path.GetFileName(
+            root.TrimEnd(
+                Path.DirectorySeparatorChar,
+                Path.AltDirectorySeparatorChar));
+
+        while (pending.Count > 0)
+        {
+            string directory = pending.Pop();
+
+            foreach (string filePath in
+                     Directory.GetFiles(directory))
+            {
+                FileAttributes attributes =
+                    File.GetAttributes(filePath);
+
+                // Do not follow symbolic links or other reparse points.
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    continue;
+
+                var info = new FileInfo(filePath);
+
+                string relative = Path.GetRelativePath(
+                    root, info.FullName);
+
+                relative = relative
+                    .Replace('\\', '/');
+
+                string archivePath = includeFolderName
+                    ? rootName + "/" + relative
+                    : relative;
+
+                result.Add(new PackSourceFile(
+                    Path.GetFullPath(info.FullName),
+                    archivePath,
+                    (ulong)info.Length));
+            }
+
+            foreach (string childDirectory in
+                     Directory.GetDirectories(directory))
+            {
+                FileAttributes attributes =
+                    File.GetAttributes(childDirectory);
+
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    continue;
+
+                pending.Push(childDirectory);
+            }
+        }
+
+        return result;
+    }
+
+    private void AddEntries(List<PackSourceFile> additions)
+    {
+        if (additions.Count == 0)
+            return;
+
+        var seen = new HashSet<string>(
+            _files.Select(f => f.ArchivePath),
+            StringComparer.OrdinalIgnoreCase);
+
+        var collisions = new List<string>();
+
+        foreach (var file in additions)
+        {
+            try
+            {
+                MainForm.ValidateArchiveEntryPath(file.ArchivePath);
+            }
+            catch (Exception ex)
+            {
+                collisions.Add(
+                    $"{file.ArchivePath}: {ex.Message}");
+
+                if (collisions.Count >= 10)
+                    break;
+
+                continue;
+            }
+
+            if (!seen.Add(file.ArchivePath))
+            {
+                collisions.Add(file.ArchivePath);
+
+                if (collisions.Count >= 10)
+                    break;
+            }
+        }
+
+        if (collisions.Count > 0)
+        {
+            MessageBox.Show(
+                this,
+                "The selected items contain an invalid or duplicate archive path.\n\n" +
+                string.Join("\n", collisions) +
+                "\n\nNo items from this batch were added.",
+                "Archive path conflict",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            return;
+        }
+
+        foreach (var file in additions)
+        {
+            _files.Add(file);
+
+            var item = new ListViewItem(file.ArchivePath);
+
+            item.SubItems.Add(file.SourcePath);
+            item.SubItems.Add(FormatSize(file.Size));
+            item.ToolTipText = file.SourcePath;
+
+            _list.Items.Add(item);
+        }
+
+        UpdateSummary();
+    }
+
+    private void RemoveSelected()
+    {
+        int[] selectedIndices = _list.SelectedIndices
+            .Cast<int>()
+            .OrderByDescending(i => i)
+            .ToArray();
+
+        foreach (int index in selectedIndices)
+        {
+            if (index >= 0 && index < _files.Count)
+            {
+                _files.RemoveAt(index);
+                _list.Items.RemoveAt(index);
+            }
+        }
+
+        UpdateSummary();
+    }
+
+    private void ClearList()
+    {
+        if (_files.Count == 0)
+            return;
+
+        _files.Clear();
+        _list.Items.Clear();
+
+        UpdateSummary();
+    }
+
+    private void BrowseOutput()
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Choose archive output path",
+            Filter =
+                "ZArchive (*.zar)|*.zar|" +
+                "ZArchive/WUA (*.wua)|*.wua|" +
+                "All files (*.*)|*.*",
+            DefaultExt = "zar",
+            AddExtension = true,
+            OverwritePrompt = false,
+            FileName = Path.GetFileName(_outputBox.Text)
+        };
+
+        string? currentDirectory =
+            Path.GetDirectoryName(_outputBox.Text);
+
+        if (!string.IsNullOrWhiteSpace(currentDirectory) &&
+            Directory.Exists(currentDirectory))
+        {
+            dialog.InitialDirectory = currentDirectory;
+        }
+
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            _outputBox.Text = dialog.FileName;
+        }
+    }
+
+    private void ConfirmCreate()
+    {
+        if (_files.Count == 0)
+        {
+            MessageBox.Show(
+                this,
+                "Add at least one file or folder.",
+                "Create archive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+
+            return;
+        }
+
+        string rawOutput = _outputBox.Text.Trim();
+
+        if (rawOutput.Length == 0)
+        {
+            MessageBox.Show(
+                this,
+                "Choose an output path.",
+                "Create archive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            return;
+        }
+
+        try
+        {
+            if (Path.GetExtension(rawOutput).Length == 0)
+            {
+                rawOutput += ".zar";
+            }
+
+            string extension = Path.GetExtension(rawOutput);
+
+            if (!extension.Equals(
+                    ".zar",
+                    StringComparison.OrdinalIgnoreCase) &&
+                !extension.Equals(
+                    ".wua",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show(
+                    this,
+                    "Choose a .zar or .wua output extension.",
+                    "Create archive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            OutputPath = Path.GetFullPath(rawOutput);
+            _outputBox.Text = OutputPath;
+
+            var duplicates = _files
+                .GroupBy(
+                    f => f.ArchivePath,
+                    StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() > 1)
+                .Select(g => g.Key)
+                .Take(10)
+                .ToList();
+
+            if (duplicates.Count > 0)
+            {
+                MessageBox.Show(
+                    this,
+                    "Duplicate archive paths were found:\n\n" +
+                    string.Join("\n", duplicates),
+                    "Create archive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            foreach (var file in _files)
+            {
+                if (!File.Exists(file.SourcePath))
+                {
+                    MessageBox.Show(
+                        this,
+                        $"A queued source file no longer exists:\n\n" +
+                        $"{file.SourcePath}",
+                        "Create archive",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+
+                    return;
+                }
+
+                MainForm.ValidateArchiveEntryPath(file.ArchivePath);
+            }
+
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "Invalid archive settings",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    private void UpdateSummary()
+    {
+        ulong totalBytes = 0;
+
+        foreach (var file in _files)
+        {
+            totalBytes = totalBytes > ulong.MaxValue - file.Size
+                ? ulong.MaxValue
+                : totalBytes + file.Size;
+        }
+
+        _summaryLabel.Text =
+            $"{_files.Count:N0} files queued — " +
+            $"{FormatSize(totalBytes)} uncompressed";
     }
 
     private static string FormatSize(ulong bytes)
