@@ -37,7 +37,15 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: dotnet build .\ZarExplorer.csproj -c Release -r win-x64 --no-restore
+        run: |
+          dotnet build .\ZarExplorer.csproj `
+            -c Release `
+            -r win-x64 `
+            --no-restore
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed."
+          }
 
       - name: Publish self-contained application
         shell: pwsh
@@ -56,10 +64,14 @@ jobs:
             -o $publishDir
 
           if ($LASTEXITCODE -ne 0) {
-            throw "dotnet publish failed."
+            throw "Publish failed."
           }
 
-      - name: Package release files
+          if (-not (Test-Path (Join-Path $publishDir "ZarExplorer.exe"))) {
+            throw "ZarExplorer.exe was not produced."
+          }
+
+      - name: Package application and licensing files
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -68,55 +80,131 @@ jobs:
             $version = $env:GITHUB_REF_NAME
           }
           else {
-            $version = "dev-" + $env:GITHUB_SHA.Substring(0, 7)
+            $commit = $env:GITHUB_SHA
+            $version = "dev-" + $commit.Substring(0, 7)
           }
 
           $publishDir = Join-Path $env:RUNNER_TEMP "ZarExplorer-publish"
           $stageDir = Join-Path $env:RUNNER_TEMP "ZarExplorer-package"
           $artifactDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
 
-          if (-not (Test-Path $publishDir)) {
-            throw "Published application directory not found."
+          # Validate required project files.
+          $requiredDocs = @(
+            "README.md",
+            "LICENSE",
+            "THIRD-PARTY-NOTICES.md"
+          )
+
+          foreach ($file in $requiredDocs) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Required project file is missing: $file"
+            }
+          }
+
+          if (Test-Path -LiteralPath $stageDir) {
+            Remove-Item -LiteralPath $stageDir -Recurse -Force
+          }
+
+          if (Test-Path -LiteralPath $artifactDir) {
+            Remove-Item -LiteralPath $artifactDir -Recurse -Force
           }
 
           New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
           New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
 
-          Copy-Item -Path (Join-Path $publishDir "*") `
-            -Destination $stageDir -Recurse -Force
+          # Copy the published application.
+          Copy-Item `
+            -Path (Join-Path $publishDir "*") `
+            -Destination $stageDir `
+            -Recurse `
+            -Force
 
-          Copy-Item -Path @(
-            "README.md",
-            "LICENSE",
-            "THIRD-PARTY-NOTICES.md"
-          ) -Destination $stageDir -Force
+          # Include the application's documentation and license.
+          foreach ($file in $requiredDocs) {
+            Copy-Item -LiteralPath $file -Destination $stageDir -Force
+          }
 
+          # Include the exact ZArchiveSharp dependency notices.
           $dependencyBase = "https://raw.githubusercontent.com/purelogiccode/ZArchiveSharp/v1.4.0"
 
           Invoke-WebRequest `
             -Uri "$dependencyBase/LICENSE" `
-            -OutFile (Join-Path $stageDir "ZArchiveSharp-LICENSE.txt")
+            -OutFile (Join-Path $stageDir "ZArchiveSharp-LICENSE.txt") `
+            -ErrorAction Stop
 
           Invoke-WebRequest `
             -Uri "$dependencyBase/THIRD-PARTY-NOTICES.md" `
-            -OutFile (Join-Path $stageDir "ZArchiveSharp-THIRD-PARTY-NOTICES.md")
+            -OutFile (Join-Path $stageDir "ZArchiveSharp-THIRD-PARTY-NOTICES.md") `
+            -ErrorAction Stop
 
+          # Locate the .NET installation actually used by the build.
+          $basePathMatch = dotnet --info |
+            Select-String '^\s*Base Path:\s*(.+)$' |
+            Select-Object -First 1
+
+          if (-not $basePathMatch) {
+            throw "Could not locate the active .NET SDK."
+          }
+
+          $sdkBasePath = $basePathMatch.Matches[0].Groups[1].Value.Trim()
+          $dotnetRoot = (Resolve-Path (Join-Path $sdkBasePath "..\..")).Path
+
+          # Include the .NET distribution's general license and notices.
+          $dotnetFiles = @(
+            @{
+              Source = Join-Path $dotnetRoot "LICENSE.txt"
+              Target = "Microsoft-.NET-LICENSE.txt"
+            },
+            @{
+              Source = Join-Path $dotnetRoot "ThirdPartyNotices.txt"
+              Target = "Microsoft-.NET-ThirdPartyNotices.txt"
+            }
+          )
+
+          foreach ($item in $dotnetFiles) {
+            if (-not (Test-Path -LiteralPath $item.Source)) {
+              throw "Required .NET notice file is missing: $($item.Source)"
+            }
+
+            Copy-Item `
+              -LiteralPath $item.Source `
+              -Destination (Join-Path $stageDir $item.Target) `
+              -Force
+          }
+
+          # Include Microsoft's .NET Library License terms.
+          Invoke-WebRequest `
+            -Uri "https://dotnet.microsoft.com/en-us/dotnet_library_license.htm" `
+            -OutFile (Join-Path $stageDir "Microsoft-.NET-Library-License.html") `
+            -ErrorAction Stop
+
+          # Include Microsoft's explanation of Windows .NET licensing.
+          Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/dotnet/core/main/license-information-windows.md" `
+            -OutFile (Join-Path $stageDir "Microsoft-.NET-Windows-License-Info.md") `
+            -ErrorAction Stop
+
+          # Create the portable ZIP.
           $zipName = "ZarExplorer-win-x64-$version.zip"
           $zipPath = Join-Path $artifactDir $zipName
 
           Compress-Archive `
             -Path (Join-Path $stageDir "*") `
             -DestinationPath $zipPath `
+            -CompressionLevel Optimal `
             -Force
 
-          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          # Generate the SHA-256 checksum.
+          $hash = (
+            Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
 
           Set-Content `
             -LiteralPath "$zipPath.sha256" `
             -Value "$hash  $zipName" `
             -Encoding ascii
 
-          Write-Host "Created $zipName"
+          Write-Host "Created: $zipName"
           Write-Host "SHA-256: $hash"
 
       - name: Upload build artifacts
@@ -140,7 +228,7 @@ jobs:
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ZarExplorer-build-${{ github.run_id }}
           path: release-assets
